@@ -74,6 +74,18 @@ journalctl -u sysmon-fand -f
 
 The service runs `--check` before every start, so a broken config never takes over a fan.
 
+## Turn it off
+
+To stop fan control without uninstalling:
+
+```sh
+sudo systemctl disable --now sysmon-fand
+```
+
+This stops the daemon and keeps it from starting at boot. As it stops, each fan is handed back to your firmware's automatic control or, where the driver doesn't allow that, held at `failsafe_percent`. Either way, rebooting gives every fan header back to the firmware.
+
+To stop it only until the next boot, use `sudo systemctl stop sysmon-fand` instead. To turn it back on, run `sudo systemctl enable --now sysmon-fand`.
+
 ## Uninstall
 
 ```sh
