@@ -315,7 +315,6 @@ Panel {
               spacing: Style.space(10)
               LegendItem { swatch: Color.accent; caption: "CPU" }
               LegendItem { visible: root.gpuSeen; swatch: root.bar.foreground; swatchOpacity: 0.55; caption: "GPU" }
-              LegendItem { swatch: root.bar.urgent; swatchOpacity: 0.5; caption: root.warnTemp + "°C" }
             }
           }
 
@@ -324,8 +323,8 @@ Panel {
             width: parent.width
             height: Style.space(64)
 
-            // From a little below the coolest reading to just above warnTemp, so
-            // the warning line always shows how much headroom is left.
+            // Fits the readings with a little padding. A minimum span keeps a
+            // steady temperature from looking like big swings.
             readonly property var range: {
               var lo = Infinity
               var hi = -Infinity
@@ -335,9 +334,9 @@ Panel {
                 if (h[i].gpu !== null) { lo = Math.min(lo, h[i].gpu); hi = Math.max(hi, h[i].gpu) }
               }
               if (lo === Infinity) { lo = 30; hi = 60 }
-              hi = Math.max(hi, root.warnTemp) + 2
-              lo = Math.min(lo - 5, hi - 20)
-              return { lo: lo, hi: hi }
+              var mid = (lo + hi) / 2
+              var span = Math.max(hi - lo + 6, 15)
+              return { lo: mid - span / 2, hi: mid + span / 2 }
             }
 
             function yFor(t) { return height - (t - range.lo) / (range.hi - range.lo) * height }
@@ -366,15 +365,6 @@ Panel {
             Shape {
               anchors.fill: parent
               preferredRendererType: Shape.CurveRenderer
-
-              ShapePath {
-                strokeColor: Qt.rgba(root.bar.urgent.r, root.bar.urgent.g, root.bar.urgent.b, 0.5)
-                strokeWidth: 1
-                fillColor: "transparent"
-                startX: 0
-                startY: graph.yFor(root.warnTemp)
-                PathLine { x: graph.width; y: graph.yFor(root.warnTemp) }
-              }
 
               ShapePath {
                 strokeColor: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.55)

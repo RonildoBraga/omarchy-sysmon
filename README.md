@@ -22,7 +22,7 @@ Needs Omarchy 4 for its plugin system, `jq` (included with Omarchy), and `nvidia
 
 ## What it shows
 
-- **Temperature history:** a graph of CPU and GPU temperature over the last few minutes, with a line at `warnTemp` so you can see the headroom. It's kept in memory, so it starts empty whenever the shell restarts.
+- **Temperature history:** a graph of CPU and GPU temperature over the last few minutes. It's kept in memory, so it starts empty whenever the shell restarts.
 - **Processor, graphics and memory:** usage, temperatures, load average, video memory and power draw.
 - **Storage:** each drive's temperature, highlighted once it passes the drive's own warning threshold, and usage for the filesystems in `disks`, highlighted above 90%. A path on a filesystem that's already listed, such as `/home` on a single-partition install, isn't repeated. NVMe drives work out of the box. SATA drives need the kernel's `drivetemp` module: `sudo modprobe drivetemp`, and add `drivetemp` to a file in `/etc/modules-load.d/` to keep it after a reboot.
 - **Network:** download and upload speed across your physical network interfaces. Docker bridges, VPN tunnels and loopback are skipped, because their traffic already passes through a physical interface.
