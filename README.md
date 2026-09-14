@@ -1,10 +1,12 @@
 # omarchy-sysmon
 
-A system monitor for the [Omarchy](https://omarchy.org) bar: one icon, and a card with CPU, GPU, memory and fan readings, styled like Omarchy's own panels.
+A system monitor for the [Omarchy](https://omarchy.org) bar: one icon, and a card with CPU, GPU, memory, storage, network and fan readings plus a graph of recent temperatures, styled like Omarchy's own panels.
 
-![The system monitor card](docs/screenshot.png)
+![The system monitor icon in the Omarchy bar, with its card open below it](docs/screenshot.png)
 
-- **Detects your hardware at runtime.** Intel and AMD CPU temperatures, NVIDIA and AMD GPUs, and every fan your motherboard driver exposes. Nothing is hard-coded for one machine.
+*Click the icon in the bar to open the card. The hardware shown is a demo.*
+
+- **Detects your hardware at runtime.** Intel and AMD CPU temperatures, NVIDIA and AMD GPUs, NVMe and SATA drives, and every fan your motherboard driver exposes. Nothing is hard-coded for one machine.
 - **Read-only.** The card never changes anything. Optional fan control lives in [`fan-control/`](fan-control/) and is installed separately.
 - **Leaves a sleeping NVIDIA GPU asleep** instead of waking it every few seconds to read its temperature, which matters on laptops.
 
@@ -18,6 +20,14 @@ The icon appears in the right section of the bar. Click it for the card, or righ
 
 Needs Omarchy 4 for its plugin system, `jq` (included with Omarchy), and `nvidia-smi` if you have an NVIDIA GPU.
 
+## What it shows
+
+- **Temperature history:** a graph of CPU and GPU temperature over the last few minutes, with a line at `warnTemp` so you can see the headroom. It's kept in memory, so it starts empty whenever the shell restarts.
+- **Processor, graphics and memory:** usage, temperatures, load average, video memory and power draw.
+- **Storage:** each drive's temperature, highlighted once it passes the drive's own warning threshold, and usage for the filesystems in `disks`, highlighted above 90%. A path on a filesystem that's already listed, such as `/home` on a single-partition install, isn't repeated. NVMe drives work out of the box. SATA drives need the kernel's `drivetemp` module: `sudo modprobe drivetemp`, and add `drivetemp` to a file in `/etc/modules-load.d/` to keep it after a reboot.
+- **Network:** download and upload speed across your physical network interfaces. Docker bridges, VPN tunnels and loopback are skipped, because their traffic already passes through a physical interface.
+- **Cooling:** fan speeds. See [Naming fans](#naming-fans).
+
 ## Settings
 
 Settings go on the widget's entry in `~/.config/omarchy/shell.json`, so they stay on your machine and survive plugin updates.
@@ -28,6 +38,11 @@ Settings go on the widget's entry in `~/.config/omarchy/shell.json`, so they sta
 | `refreshIntervalSec` | `3` | seconds between readings |
 | `warnTemp` | `80` | the icon turns to the urgent colour when the CPU or GPU reaches this (°C) |
 | `fans` | `[]` | names for your fans, see below |
+| `showHistory` | `true` | show the temperature graph |
+| `historyMinutes` | `5` | minutes of history in the graph (1 to 60) |
+| `showStorage` | `true` | show drive temperatures and disk usage |
+| `disks` | `["/", "/home"]` | filesystems to show usage for |
+| `showNetwork` | `true` | show download and upload speed |
 
 ### Naming fans
 

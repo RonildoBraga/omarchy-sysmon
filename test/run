@@ -46,8 +46,8 @@ collect() { # FIXTURE [ARGS...]  (a name in test/fixtures, or a path)
   [[ $fx == /* ]] || fx=$FIX/$fx
   proc=$FIX/proc
   [[ -d $fx/proc ]] && proc=$fx/proc
-  SYSMON_SYSFS=$fx/sys SYSMON_PROC=$proc SYSMON_NVIDIA_SMI=$fx/bin/nvidia-smi \
-    SYSMON_STATE=${STATE_FILE:-$(mktemp -u "$TMP/state.XXXX")} \
+  SYSMON_SYSFS=$fx/sys SYSMON_PROC=$proc SYSMON_NVIDIA_SMI=$fx/bin/nvidia-smi SYSMON_DF=$fx/bin/df \
+    SYSMON_STATE=${STATE_FILE:-$(mktemp -u "$TMP/state.XXXX")} SYSMON_NOW_US=${NOW_US:-} \
     SYSMON_FAN_UNIT=sysmon-test-absent.service \
     "$ROOT/bin/sysmon-collect" "$@"
 }
@@ -72,8 +72,8 @@ check "--gpu none skips the GPU" expect intel-nvidia '.gpu == null' --gpu none
 check "invalid --gpu is rejected" bash -c '! "$0" --gpu bogus' "$ROOT/bin/sysmon-collect"
 
 t_cpu_usage() {
-  printf '100 900\n' >"$TMP/cpu.state"
-  STATE_FILE=$TMP/cpu.state expect intel-nvidia '.cpu.pct == 50'
+  printf '100 900 1000000000 0 0\n' >"$TMP/cpu.state"
+  STATE_FILE=$TMP/cpu.state NOW_US=1002000000 expect intel-nvidia '.cpu.pct == 50'
 }
 check "cpu usage from the previous sample" t_cpu_usage
 
@@ -96,6 +96,26 @@ check "amd gpu fan and pwm" expect amd \
   '.fans == [{chip: "amdgpu", index: 1, rpm: 1200, label: null}] and .pwm == [{chip: "amdgpu", index: 1, duty: 40, mode: 2}]'
 check "minimal machine: no cpu sensor, gpu, fans or swap" expect minimal \
   '.cpu.temp == null and .gpu == null and .fans == [] and .pwm == [] and .swap == {pct: 0, usedGiB: 0, totalGiB: 0}'
+
+check "storage: NVMe temperature, trimmed model, and the drive's warning threshold" expect intel-nvidia \
+  '.storage == [{label: "Test NVMe 1TB", temp: 43, max: 81}]'
+check "storage: SATA drive via drivetemp" expect amd '.storage == [{label: "Test SATA SSD", temp: 38, max: null}]'
+check "disks: usage per filesystem, same device listed once, unknown paths skipped" expect intel-nvidia \
+  '.disks == [
+    {path: "/", sizeBytes: 1000204886016, usedBytes: 512110190592, availBytes: 488094695424, pct: 51},
+    {path: "/data", sizeBytes: 4000787030016, usedBytes: 1000000000000, availBytes: 3000787030016, pct: 25}]' \
+  --disk / --disk /home --disk /data --disk /missing
+check "disks: none unless asked for" expect intel-nvidia '.disks == []'
+check "--disk needs a path" bash -c '! "$0" --disk' "$ROOT/bin/sysmon-collect"
+
+t_network_speed() {
+  # Physical total now: rx 5001000, tx 1000500. Two seconds earlier: rx 3001000, tx 1000000.
+  printf '100 900 1000000000 3001000 1000000\n' >"$TMP/net.state"
+  STATE_FILE=$TMP/net.state NOW_US=1002000000 expect intel-nvidia '.net == {rxBps: 1000000, txBps: 250}'
+}
+check "network: bytes per second over physical interfaces only" t_network_speed
+check "network: the first run still reports a speed" expect intel-nvidia '.net == {rxBps: 0, txBps: 0}'
+check "network: none without a physical interface" expect minimal '.net == null and .storage == []'
 
 # --- Fan control daemon -----------------------------------------------------------------
 
@@ -232,7 +252,7 @@ SCRIPTS=("$ROOT/bin/sysmon-collect" "$ROOT/fan-control/sysmon-fand" "$ROOT/fan-c
 
 check "shell scripts parse" bash -c 'for f in "$@"; do bash -n "$f" || exit 1; done' _ "${SCRIPTS[@]}"
 check "scripts are executable" bash -c 'for f in "$@"; do [[ -x $f ]] || { echo "not executable: $f"; exit 1; }; done' _ \
-  "${SCRIPTS[@]}" "$FIX/intel-nvidia/bin/nvidia-smi"
+  "${SCRIPTS[@]}" "$FIX/intel-nvidia/bin/nvidia-smi" "$FIX/intel-nvidia/bin/df"
 check "no symlinks (omarchy plugin add rejects them)" bash -c '[[ -z $(find "$0" -name .git -prune -o -type l -print) ]]' "$ROOT"
 check "Panel.qml never declares a property named data" \
   bash -c '! grep -nE "property[[:space:]]+[A-Za-z]+[[:space:]]+data\b" "$0"' "$ROOT/Panel.qml"

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fake df: answers `df --output=source,size,used,avail -B1 -- PATH` for test paths.
+for arg; do path=$arg; done
+case "$path" in
+  / | /home)
+    echo "Filesystem 1B-blocks Used Avail"
+    echo "/dev/test-root 1000204886016 512110190592 488094695424" ;;
+  /data)
+    echo "Filesystem 1B-blocks Used Avail"
+    echo "/dev/test-data 4000787030016 1000000000000 3000787030016" ;;
+  *) echo "df: $path: No such file or directory" >&2; exit 1 ;;
+esac
