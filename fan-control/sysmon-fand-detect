@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# sysmon-fand-detect: list fan controllers, fans and PWM channels, to help you
+# write /etc/sysmon-fand/fand.conf. Read-only: it never writes anything.
+
+set -uo pipefail
+
+SYS=${SYSMON_SYSFS:-/sys}
+
+read_into() {
+  local -n __detect_dest=$1
+  __detect_dest=""
+  [[ -r $2 ]] || return 1
+  { IFS= read -r __detect_dest || [[ -n $__detect_dest ]]; } 2>/dev/null <"$2"
+}
+
+mode_name() {
+  case $1 in
+    1) printf 'manual' ;;
+    0) printf '0 (driver-specific, often full speed)' ;;
+    '') printf 'unknown' ;;
+    *) printf 'automatic (%s)' "$1" ;;
+  esac
+}
+
+found=0
+for d in "$SYS"/class/hwmon/hwmon*; do
+  read_into chip "$d/name" || continue
+  rows=()
+  for f in "$d"/fan[0-9]*_input; do
+    [[ $f =~ /fan([0-9]+)_input$ ]] || continue
+    idx=${BASH_REMATCH[1]}
+    read_into rpm "$f" || rpm='?'
+    rows+=("$(printf '  fan%-3s %6s RPM' "$idx" "$rpm")")
+  done
+  for f in "$d"/pwm[0-9]*; do
+    [[ $f =~ /pwm([0-9]+)$ ]] || continue
+    idx=${BASH_REMATCH[1]}
+    read_into raw "$f" || raw=''
+    read_into mode "${f}_enable" || mode=''
+    duty='?'
+    [[ $raw =~ ^[0-9]+$ ]] && duty="$(((raw * 100 + 127) / 255))%"
+    rows+=("$(printf '  pwm%-3s %6s duty, mode %s' "$idx" "$duty" "$(mode_name "$mode")")")
+  done
+  ((${#rows[@]})) || continue
+  found=1
+  printf '%s  %s\n' "$chip" "$d"
+  printf '%s\n' "${rows[@]}"
+  printf '\n'
+done
+
+if ((!found)); then
+  printf 'No hwmon device exposes fans or PWM channels.\n'
+  printf "Load your board's sensor driver (for example nct6775 or it87) and run this again.\n\n"
+fi
+
+cat <<'TEXT'
+Which pwm drives which fan?
+  pwmN does not always drive fanN, and one header can feed a hub of several
+  fans. You can identify them without writing anything:
+    1. Note the RPM and duty values above.
+    2. In your firmware (BIOS/UEFI) fan settings, change ONE header, for
+       example to full speed, then boot back into Linux.
+    3. Run this again. The fan whose RPM changed is on that header, and the
+       pwm channel driving it now shows a different duty.
+  Put pumps, and anything else that must never slow down, in `protect`.
+TEXT

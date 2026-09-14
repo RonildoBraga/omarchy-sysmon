@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "ronildobraga.sysmon",
+  "name": "System monitor",
+  "version": "0.1.0",
+  "author": "RonildoBraga",
+  "description": "CPU, GPU, memory and fan readings in a bar card",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "System monitor",
+    "description": "CPU, GPU, memory and fan readings in a bar card",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "gpu": "auto",
+      "refreshIntervalSec": 3,
+      "warnTemp": 80,
+      "fans": []
+    },
+    "schema": [
+      {
+        "key": "gpu",
+        "type": "enum",
+        "label": "GPU source",
+        "options": ["auto", "nvidia", "amd", "none"],
+        "defaultValue": "auto",
+        "description": "Where GPU readings come from. Use none to skip the GPU entirely."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3
+      },
+      {
+        "key": "warnTemp",
+        "type": "integer",
+        "label": "Warning temperature (°C)",
+        "min": 50,
+        "max": 105,
+        "step": 1,
+        "defaultValue": 80,
+        "description": "The bar icon switches to the urgent colour when the CPU or GPU reaches this."
+      }
+    ]
+  }
+}

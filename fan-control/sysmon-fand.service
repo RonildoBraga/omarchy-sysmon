@@ -1,0 +1,26 @@
+[Unit]
+Description=sysmon-fand temperature-driven fan control
+After=systemd-modules-load.service
+# Keep retrying rather than giving up: at boot the GPU driver or CPU sensors
+# can appear after this starts. Until --check passes, fans simply stay under
+# firmware control.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/sysmon-fand --check
+ExecStart=/usr/local/bin/sysmon-fand
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+# /run/sysmon-fand remembers each channel's original mode across restarts.
+# /run is cleared at boot, which is when the firmware takes control back.
+RuntimeDirectory=sysmon-fand
+RuntimeDirectoryPreserve=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

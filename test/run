@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# Test suite: test/run
+#
+# Runs against the fake sysfs and procfs trees in test/fixtures. They are plain
+# files with no symlinks, because `omarchy plugin add` rejects a plugin repo
+# that contains any symlink. Nothing here touches real hardware.
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+FIX=$ROOT/test/fixtures
+TMP=$(mktemp -d)
+trap 'chmod -R u+w "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
+
+pass=0
+fail=0
+
+check() { # NAME COMMAND...
+  local name=$1
+  shift
+  if "$@" >"$TMP/output" 2>&1; then
+    pass=$((pass + 1))
+    printf 'ok    %s\n' "$name"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  %s\n' "$name"
+    sed 's/^/        /' "$TMP/output"
+  fi
+}
+
+skip() { printf 'skip  %s\n' "$1"; }
+
+# A writable copy of a fixture, so a test can change it.
+copy_fixture() { # NAME
+  local dest
+  dest=$(mktemp -d "$TMP/$1.XXXX")
+  cp -a "$FIX/$1/." "$dest/"
+  printf '%s' "$dest"
+}
+
+# --- Collector --------------------------------------------------------------------
+
+collect() { # FIXTURE [ARGS...]  (a name in test/fixtures, or a path)
+  local fx=$1 proc
+  shift
+  [[ $fx == /* ]] || fx=$FIX/$fx
+  proc=$FIX/proc
+  [[ -d $fx/proc ]] && proc=$fx/proc
+  SYSMON_SYSFS=$fx/sys SYSMON_PROC=$proc SYSMON_NVIDIA_SMI=$fx/bin/nvidia-smi \
+    SYSMON_STATE=${STATE_FILE:-$(mktemp -u "$TMP/state.XXXX")} \
+    SYSMON_FAN_UNIT=sysmon-test-absent.service \
+    "$ROOT/bin/sysmon-collect" "$@"
+}
+
+expect() { # FIXTURE JQ_FILTER [ARGS...]
+  local fx=$1 filter=$2
+  shift 2
+  collect "$fx" "$@" | jq -e "$filter"
+}
+
+check "cpu temperature from coretemp" expect intel-nvidia '.cpu.temp == 53'
+check "load average" expect intel-nvidia '.cpu.load == [0.41, 0.55, 0.6]'
+check "memory" expect intel-nvidia '.mem == {pct: 25, usedGiB: 3.8, totalGiB: 15.3}'
+check "swap" expect intel-nvidia '.swap == {pct: 25, usedGiB: 1.9, totalGiB: 7.6}'
+check "nvidia readings" expect intel-nvidia \
+  '.gpu == {source: "nvidia", state: "active", name: "Test GPU", pct: 12, temp: 45, vramUsedMiB: 1024, vramTotalMiB: 12282, watts: 30.5}'
+check "fans listed with their chip, including stopped ones" expect intel-nvidia \
+  '[.fans[] | [.chip, .index, .rpm]] == [["nct6798", 1, 0], ["nct6798", 2, 791], ["nct6798", 6, 2380]]'
+check "pwm duty and mode" expect intel-nvidia '[.pwm[] | [.index, .duty, .mode]] == [[2, 20, 1], [6, 80, 5]]'
+check "fan control reported absent when not installed" expect intel-nvidia '.fanControl == "absent"'
+check "--gpu none skips the GPU" expect intel-nvidia '.gpu == null' --gpu none
+check "invalid --gpu is rejected" bash -c '! "$0" --gpu bogus' "$ROOT/bin/sysmon-collect"
+
+t_cpu_usage() {
+  printf '100 900\n' >"$TMP/cpu.state"
+  STATE_FILE=$TMP/cpu.state expect intel-nvidia '.cpu.pct == 50'
+}
+check "cpu usage from the previous sample" t_cpu_usage
+
+t_nvidia_asleep() {
+  local fx status
+  fx=$(copy_fixture intel-nvidia)
+  printf 'suspended\n' >"$fx/sys/bus/pci/devices/gpu0/power/runtime_status"
+  export SYSMON_TEST_MARK=$TMP/collect-nvidia.mark
+  expect "$fx" '.gpu == {source: "nvidia", state: "suspended", name: null, pct: null, temp: null, vramUsedMiB: null, vramTotalMiB: null, watts: null}'
+  status=$?
+  unset SYSMON_TEST_MARK
+  ((status == 0)) && [[ ! -e $TMP/collect-nvidia.mark ]]
+}
+check "a sleeping NVIDIA GPU is not woken" t_nvidia_asleep
+
+check "amd: prefers Tdie over Tctl" expect amd '.cpu.temp == 58'
+check "amd gpu readings" expect amd \
+  '.gpu == {source: "amd", state: "active", name: "AMD GPU", pct: 33, temp: 48, vramUsedMiB: 2048, vramTotalMiB: 8192, watts: 85}'
+check "amd gpu fan and pwm" expect amd \
+  '.fans == [{chip: "amdgpu", index: 1, rpm: 1200, label: null}] and .pwm == [{chip: "amdgpu", index: 1, duty: 40, mode: 2}]'
+check "minimal machine: no cpu sensor, gpu, fans or swap" expect minimal \
+  '.cpu.temp == null and .gpu == null and .fans == [] and .pwm == [] and .swap == {pct: 0, usedGiB: 0, totalGiB: 0}'
+
+# --- Fan control daemon -----------------------------------------------------------------
+
+fand() { # FIXTURE_COPY CONFIG [ARGS...]
+  local fx=$1 config=$2
+  shift 2
+  SYSMON_SYSFS=$fx/sys SYSMON_NVIDIA_SMI=$fx/bin/nvidia-smi SYSMON_FAND_RUN_DIR=$fx/run \
+    SYSMON_FAND_ALLOW_NONROOT=1 "$ROOT/fan-control/sysmon-fand" --config "$config" "$@"
+}
+
+write_conf() { # FILE LINE...
+  local file=$1
+  shift
+  printf '%s\n' "$@" >"$file"
+}
+
+good_conf() { # FILE
+  write_conf "$1" "chip = nct6798" "interval = 1" "protect = 6" \
+    "channel.2.label = Case fans" "channel.2.min_percent = 15" "channel.2.max_percent = 70" \
+    "channel.2.cpu_curve = 50:15 60:35" "channel.2.gpu_curve = 40:10 50:30"
+}
+
+t_check_ok() {
+  local fx
+  fx=$(copy_fixture intel-nvidia)
+  good_conf "$TMP/ok.conf"
+  fand "$fx" "$TMP/ok.conf" --check
+}
+check "--check accepts a valid config" t_check_ok
+
+t_rejects() { # CONFIG LINE...
+  local fx
+  fx=$(copy_fixture intel-nvidia)
+  write_conf "$TMP/bad.conf" "$@"
+  ! fand "$fx" "$TMP/bad.conf" --check
+}
+check "refuses a missing config" bash -c '! "$0" --config /nonexistent/fand.conf --check' "$ROOT/fan-control/sysmon-fand"
+check "refuses a config with no channels" t_rejects "chip = nct6798"
+check "refuses to control a protected channel" t_rejects "chip = nct6798" "protect = 2" \
+  "channel.2.min_percent = 15" "channel.2.max_percent = 70" "channel.2.cpu_curve = 50:15 60:35"
+check "refuses failsafe_percent above max_percent" t_rejects "chip = nct6798" \
+  "channel.2.min_percent = 15" "channel.2.max_percent = 70" "channel.2.failsafe_percent = 90" "channel.2.cpu_curve = 50:15"
+check "refuses unknown settings (typos)" t_rejects "chip = nct6798" "chanel.2.min_percent = 15"
+check "refuses curves whose temperatures do not increase" t_rejects "chip = nct6798" \
+  "channel.2.min_percent = 15" "channel.2.max_percent = 70" "channel.2.cpu_curve = 60:30 50:15"
+check "refuses a chip that is not present" t_rejects "chip = it8792" \
+  "channel.2.min_percent = 15" "channel.2.max_percent = 70" "channel.2.cpu_curve = 50:15"
+check "the shipped example config is inert" bash -c '! "$0/fan-control/sysmon-fand" --config "$0/fan-control/fand.conf.example" --check' "$ROOT"
+
+t_dry_run() {
+  local fx before
+  fx=$(copy_fixture intel-nvidia)
+  good_conf "$TMP/dry.conf"
+  before=$(cd "$fx" && find sys -type f -exec md5sum {} + | sort)
+  fand "$fx" "$TMP/dry.conf" --dry-run --once | grep -F 'pwm2 <- 54 (21%)' &&
+    [[ $(cd "$fx" && find sys -type f -exec md5sum {} + | sort) == "$before" ]] &&
+    [[ ! -e $fx/run ]]
+}
+check "dry run computes the curve and writes nothing" t_dry_run
+
+t_hands_back() {
+  local fx hw
+  fx=$(copy_fixture intel-nvidia)
+  hw=$fx/sys/class/hwmon/hwmon1
+  printf '5\n' >"$hw/pwm2_enable"
+  good_conf "$TMP/back.conf"
+  fand "$fx" "$TMP/back.conf" --once &&
+    [[ $(<"$hw/pwm2") == 54 && $(<"$hw/pwm2_enable") == 5 ]] &&
+    [[ $(<"$hw/pwm6") == 204 && $(<"$hw/pwm6_enable") == 5 ]] &&
+    [[ $(<"$fx/run/pwm2.original") == "5 yes" ]]
+}
+check "takes over, hands the channel back, and never touches the protected one" t_hands_back
+
+t_irreversible() {
+  local fx hw out
+  if ((EUID == 0)); then
+    echo "running as root: a rejected write cannot be simulated"
+    return 0
+  fi
+  fx=$(copy_fixture intel-nvidia)
+  hw=$fx/sys/class/hwmon/hwmon1
+  printf '5\n' >"$hw/pwm2_enable"
+  chmod a-w "$hw/pwm2_enable"
+  good_conf "$TMP/irr.conf"
+  out=$(fand "$fx" "$TMP/irr.conf" --once 2>&1) && return 1
+  printf '%s\n' "$out"
+  [[ $out == *"rejects restoring mode 5"* && $(<"$hw/pwm2") == 51 ]]
+}
+check "refuses a channel whose automatic mode cannot be restored" t_irreversible
+
+t_failsafe() {
+  local fx out
+  fx=$(copy_fixture intel-nvidia)
+  rm "$fx/sys/class/hwmon/hwmon0/temp1_input"
+  write_conf "$TMP/fs.conf" "chip = nct6798" "gpu = none" \
+    "channel.2.min_percent = 15" "channel.2.max_percent = 70" "channel.2.failsafe_percent = 65" \
+    "channel.2.cpu_curve = 50:15 60:35"
+  out=$(fand "$fx" "$TMP/fs.conf" --dry-run --once 2>&1)
+  printf '%s\n' "$out"
+  [[ $out == *"pwm2 <- 166 (65%)"* && $out == *unreadable* ]]
+}
+check "holds failsafe_percent when a temperature is unreadable" t_failsafe
+
+t_gpu_asleep() {
+  local fx out
+  fx=$(copy_fixture intel-nvidia)
+  printf 'suspended\n' >"$fx/sys/bus/pci/devices/gpu0/power/runtime_status"
+  write_conf "$TMP/gs.conf" "chip = nct6798" \
+    "channel.2.min_percent = 15" "channel.2.max_percent = 70" "channel.2.gpu_curve = 40:10 50:30"
+  export SYSMON_TEST_MARK=$TMP/fand-nvidia.mark
+  out=$(fand "$fx" "$TMP/gs.conf" --dry-run --once 2>&1)
+  unset SYSMON_TEST_MARK
+  printf '%s\n' "$out"
+  [[ $out == *"pwm2 <- 38 (15%)"* && $out != *unreadable* && ! -e $TMP/fand-nvidia.mark ]]
+}
+check "ignores a sleeping GPU without waking it" t_gpu_asleep
+
+t_above_curve() {
+  local fx out
+  fx=$(copy_fixture intel-nvidia)
+  printf '95000\n' >"$fx/sys/class/hwmon/hwmon0/temp1_input"
+  write_conf "$TMP/hot.conf" "chip = nct6798" "gpu = none" \
+    "channel.2.min_percent = 15" "channel.2.max_percent = 70" "channel.2.cpu_curve = 50:15 60:35"
+  out=$(fand "$fx" "$TMP/hot.conf" --dry-run --once 2>&1)
+  printf '%s\n' "$out"
+  [[ $out == *"pwm2 <- 179 (70%)"* ]]
+}
+check "past the last curve point it runs at max_percent, never beyond" t_above_curve
+
+# --- Repository -------------------------------------------------------------------------
+
+SCRIPTS=("$ROOT/bin/sysmon-collect" "$ROOT/fan-control/sysmon-fand" "$ROOT/fan-control/sysmon-fand-detect"
+  "$ROOT/fan-control/install.sh" "$ROOT/fan-control/uninstall.sh" "$ROOT/test/run")
+
+check "shell scripts parse" bash -c 'for f in "$@"; do bash -n "$f" || exit 1; done' _ "${SCRIPTS[@]}"
+check "scripts are executable" bash -c 'for f in "$@"; do [[ -x $f ]] || { echo "not executable: $f"; exit 1; }; done' _ \
+  "${SCRIPTS[@]}" "$FIX/intel-nvidia/bin/nvidia-smi"
+check "no symlinks (omarchy plugin add rejects them)" bash -c '[[ -z $(find "$0" -name .git -prune -o -type l -print) ]]' "$ROOT"
+check "Panel.qml never declares a property named data" \
+  bash -c '! grep -nE "property[[:space:]]+[A-Za-z]+[[:space:]]+data\b" "$0"' "$ROOT/Panel.qml"
+check "manifest id matches Panel.qml moduleName" \
+  bash -c 'grep -qF "moduleName: \"$(jq -r .id "$0/manifest.json")\"" "$0/Panel.qml"' "$ROOT"
+
+if command -v omarchy-plugin-validate >/dev/null 2>&1; then
+  check "omarchy plugin validate" omarchy-plugin-validate "$ROOT"
+else
+  skip "omarchy plugin validate (not on an Omarchy system)"
+fi
+
+if command -v shellcheck >/dev/null 2>&1; then
+  check "shellcheck" shellcheck "${SCRIPTS[@]}"
+else
+  skip "shellcheck (not installed)"
+fi
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+((fail == 0))

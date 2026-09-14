@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# sysmon-fand: temperature-driven PWM fan control for hwmon fan headers.
+#
+# Usage:
+#   sysmon-fand [--config FILE] [--dry-run] [--once]
+#   sysmon-fand --check [--config FILE]
+#
+# There are no built-in channel numbers: it refuses to run until you have
+# identified your own hardware and written /etc/sysmon-fand/fand.conf. Read
+# fan-control/README.md first. Writing the wrong PWM channel can slow or stop a
+# pump or a CPU fan.
+#
+# This file is self-contained on purpose. It runs as root, so it must never
+# source helpers from a user-writable place such as the plugin folder.
+
+set -uo pipefail
+
+CONFIG=/etc/sysmon-fand/fand.conf
+MODE=run
+DRY_RUN=0
+ONCE=0
+
+# Overrides for the test suite.
+SYS=${SYSMON_SYSFS:-/sys}
+NVIDIA_SMI=${SYSMON_NVIDIA_SMI:-nvidia-smi}
+RUN_DIR=${SYSMON_FAND_RUN_DIR:-/run/sysmon-fand}
+
+log() { printf 'sysmon-fand: %s\n' "$*"; }
+die() { printf 'sysmon-fand: %s\n' "$*" >&2; exit 1; }
+
+while (($#)); do
+  case $1 in
+    --config) (($# >= 2)) || die "--config needs a path"; CONFIG=$2; shift 2 ;;
+    --check) MODE=check; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --once) ONCE=1; shift ;;
+    -h | --help) sed -n '4,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+done
+
+# --- Helpers ----------------------------------------------------------------------
+
+# Read the first line of file $2 into the variable named $1, without a subshell.
+read_into() {
+  local -n __fand_dest=$1
+  __fand_dest=""
+  [[ -r $2 ]] || return 1
+  { IFS= read -r __fand_dest || [[ -n $__fand_dest ]]; } 2>/dev/null <"$2"
+}
+
+# Whole number into the variable named $1, in base 10 so "08" is not octal.
+to_int() { # OUTVAR VALUE WHAT
+  local -n __fand_int=$1
+  [[ $2 =~ ^[0-9]+$ ]] || die "$3 must be a whole number, got '$2'"
+  __fand_int=$((10#$2))
+}
+
+find_hwmon() { # OUTVAR NAME
+  local -n __fand_hw=$1
+  local d n
+  for d in "$SYS"/class/hwmon/hwmon*; do
+    read_into n "$d/name" || continue
+    if [[ $n == "$2" ]]; then
+      __fand_hw=$d
+      return 0
+    fi
+  done
+  return 1
+}
+
+temp_by_label() { # OUTVAR DIR LABEL...  (first label found wins)
+  local -n __fand_temp=$1
+  local dir=$2 want f label raw
+  shift 2
+  __fand_temp=""
+  for want in "$@"; do
+    for f in "$dir"/temp*_label; do
+      read_into label "$f" || continue
+      [[ $label == "$want" ]] || continue
+      read_into raw "${f%_label}_input" && [[ $raw =~ ^-?[0-9]+$ ]] || continue
+      __fand_temp=$((raw / 1000))
+      return 0
+    done
+  done
+  return 1
+}
+
+# --- Configuration -----------------------------------------------------------------
+
+declare -A CONF=()
+GLOBAL_KEYS=" chip interval gpu protect falloff_percent allow_irreversible "
+CHANNEL_KEYS=" label min_percent max_percent failsafe_percent cpu_curve gpu_curve "
+
+# Plain `key = value` lines. The file is parsed, never sourced: a root process
+# must not execute whatever text happens to be in its config.
+parse_config() {
+  local line key value n=0
+  [[ -r $CONFIG ]] || die "cannot read $CONFIG (copy fand.conf.example there and edit it)"
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=${line%%#*}
+    [[ $line =~ ^[[:space:]]*$ ]] && continue
+    [[ $line =~ ^[[:space:]]*([A-Za-z0-9_.]+)[[:space:]]*=[[:space:]]*(.*)$ ]] ||
+      die "$CONFIG:$n: expected 'key = value'"
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    value=${value%"${value##*[![:space:]]}"}
+    if [[ $key == channel.* ]]; then
+      [[ $key =~ ^channel\.([0-9]+)\.([a-z_]+)$ ]] ||
+        die "$CONFIG:$n: '$key' should look like channel.<number>.<setting>"
+      [[ $CHANNEL_KEYS == *" ${BASH_REMATCH[2]} "* ]] || die "$CONFIG:$n: unknown setting '$key'"
+      key="channel.$((10#${BASH_REMATCH[1]})).${BASH_REMATCH[2]}"
+    elif [[ $GLOBAL_KEYS != *" $key "* ]]; then
+      die "$CONFIG:$n: unknown setting '$key'"
+    fi
+    [[ -z ${CONF[$key]+set} ]] || die "$CONFIG:$n: '$key' is set twice"
+    CONF[$key]=$value
+  done <"$CONFIG"
+}
+
+conf() { # OUTVAR KEY DEFAULT
+  local -n __fand_conf=$1
+  if [[ -n ${CONF[$2]+set} ]]; then __fand_conf=${CONF[$2]}; else __fand_conf=$3; fi
+}
+
+declare -a CHANNELS=() PROTECT=() TAKEN=()
+declare -A CH_LABEL=() CH_MIN=() CH_MAX=() CH_FAILSAFE=() CH_CPU=() CH_GPU=()
+declare -A CURRENT=() ORIGINAL=() RESTORABLE=() LAST_RAW=() WARNED=()
+
+is_protected() {
+  local p
+  for p in "${PROTECT[@]}"; do
+    ((p == $1)) && return 0
+  done
+  return 1
+}
+
+validate_curve() { # CHANNEL SETTING VALUE
+  local pts pt t p prev=-1
+  [[ -n $3 ]] || return 0
+  read -ra pts <<<"$3"
+  for pt in "${pts[@]}"; do
+    [[ $pt =~ ^([0-9]+):([0-9]+)$ ]] || die "channel $1: $2 point '$pt' is not temp:percent"
+    t=$((10#${BASH_REMATCH[1]})) p=$((10#${BASH_REMATCH[2]}))
+    ((t > prev)) || die "channel $1: $2 temperatures must increase ('$pt')"
+    ((p <= 100)) || die "channel $1: $2 percent above 100 ('$pt')"
+    prev=$t
+  done
+}
+
+setup() {
+  local value key ch n parts p lo hi fs
+
+  parse_config
+
+  conf CHIP chip ""
+  [[ -n $CHIP ]] || die "'chip' is not set"
+  find_hwmon HW "$CHIP" || die "no hwmon chip named '$CHIP'. Is its driver loaded? Run sysmon-fand-detect."
+
+  conf value interval 3
+  to_int INTERVAL "$value" interval
+  ((INTERVAL >= 1 && INTERVAL <= 60)) || die "interval must be 1-60 seconds"
+  conf value falloff_percent 2
+  to_int FALLOFF "$value" falloff_percent
+  ((FALLOFF >= 1 && FALLOFF <= 100)) || die "falloff_percent must be 1-100"
+  conf GPU_MODE gpu auto
+  [[ $GPU_MODE =~ ^(auto|nvidia|amd|none)$ ]] || die "gpu must be auto, nvidia, amd or none"
+  conf ALLOW_IRREVERSIBLE allow_irreversible no
+  [[ $ALLOW_IRREVERSIBLE =~ ^(yes|no)$ ]] || die "allow_irreversible must be yes or no"
+
+  conf value protect ""
+  IFS=', ' read -ra parts <<<"$value"
+  for p in "${parts[@]}"; do
+    to_int n "$p" protect
+    PROTECT+=("$n")
+  done
+
+  for key in "${!CONF[@]}"; do
+    [[ $key =~ ^channel\.([0-9]+)\. ]] || continue
+    ch=${BASH_REMATCH[1]}
+    [[ " ${CHANNELS[*]} " == *" $ch "* ]] || CHANNELS+=("$ch")
+  done
+  ((${#CHANNELS[@]})) || die "no channels configured; add channel.<number>.* settings"
+  mapfile -t CHANNELS < <(printf '%s\n' "${CHANNELS[@]}" | sort -n)
+
+  for ch in "${CHANNELS[@]}"; do
+    is_protected "$ch" && die "channel $ch is listed in 'protect', so it can never be controlled"
+    [[ -e $HW/pwm$ch ]] || die "channel $ch: $HW/pwm$ch does not exist"
+    conf value "channel.$ch.label" "pwm$ch"
+    CH_LABEL[$ch]=$value
+    [[ -n ${CONF[channel.$ch.min_percent]+set} && -n ${CONF[channel.$ch.max_percent]+set} ]] ||
+      die "channel $ch: min_percent and max_percent are required"
+    to_int lo "${CONF[channel.$ch.min_percent]}" "channel.$ch.min_percent"
+    to_int hi "${CONF[channel.$ch.max_percent]}" "channel.$ch.max_percent"
+    ((lo <= hi && hi <= 100)) || die "channel $ch: need min_percent <= max_percent <= 100"
+    conf value "channel.$ch.failsafe_percent" "$hi"
+    to_int fs "$value" "channel.$ch.failsafe_percent"
+    ((fs >= lo && fs <= hi)) || die "channel $ch: failsafe_percent must be between min_percent and max_percent"
+    CH_MIN[$ch]=$lo CH_MAX[$ch]=$hi CH_FAILSAFE[$ch]=$fs
+    conf value "channel.$ch.cpu_curve" ""
+    CH_CPU[$ch]=$value
+    conf value "channel.$ch.gpu_curve" ""
+    CH_GPU[$ch]=$value
+    [[ -n ${CH_CPU[$ch]}${CH_GPU[$ch]} ]] || die "channel $ch: set cpu_curve, gpu_curve, or both"
+    validate_curve "$ch" cpu_curve "${CH_CPU[$ch]}"
+    validate_curve "$ch" gpu_curve "${CH_GPU[$ch]}"
+  done
+}
+
+# --- Sensors ---------------------------------------------------------------------------
+
+CPU_TEMP=""
+GPU_TEMP=""
+GPU_STATE=none # active | asleep | unreadable | none
+
+read_cpu_temp() {
+  local hw chip raw
+  CPU_TEMP=""
+  for chip in coretemp k10temp zenpower cpu_thermal; do
+    find_hwmon hw "$chip" || continue
+    case $chip in
+      coretemp) temp_by_label CPU_TEMP "$hw" "Package id 0" ;;
+      k10temp | zenpower) temp_by_label CPU_TEMP "$hw" Tdie Tctl ;;
+      cpu_thermal) read_into raw "$hw/temp1_input" && [[ $raw =~ ^-?[0-9]+$ ]] && CPU_TEMP=$((raw / 1000)) ;;
+    esac
+    [[ -n $CPU_TEMP ]] && return 0
+  done
+  return 1
+}
+
+nvidia_asleep() {
+  local dev vendor class status found=0
+  for dev in "$SYS"/bus/pci/devices/*; do
+    read_into vendor "$dev/vendor" && read_into class "$dev/class" || continue
+    [[ $vendor == 0x10de && $class == 0x03* ]] || continue
+    found=1
+    read_into status "$dev/power/runtime_status" || status=active
+    [[ $status == suspended ]] || return 1
+  done
+  ((found))
+}
+
+read_gpu_temp() {
+  local out hw raw
+  GPU_TEMP="" GPU_STATE=none
+  [[ $GPU_MODE == none ]] && return 0
+  if [[ $GPU_MODE == nvidia || $GPU_MODE == auto ]] && command -v "$NVIDIA_SMI" >/dev/null 2>&1; then
+    # Asking a runtime-suspended NVIDIA GPU for its temperature wakes it. A
+    # sleeping GPU is idle and cool, so it simply does not count.
+    if nvidia_asleep; then
+      GPU_STATE=asleep
+      return 0
+    fi
+    out=$("$NVIDIA_SMI" --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null)
+    out=${out%%$'\n'*} out=${out//[^0-9]/}
+    if [[ -n $out ]]; then
+      GPU_TEMP=$((10#$out)) GPU_STATE=active
+      return 0
+    fi
+  fi
+  if [[ $GPU_MODE == amd || $GPU_MODE == auto ]] && find_hwmon hw amdgpu; then
+    temp_by_label GPU_TEMP "$hw" edge ||
+      { read_into raw "$hw/temp1_input" && [[ $raw =~ ^-?[0-9]+$ ]] && GPU_TEMP=$((raw / 1000)); }
+    if [[ -n $GPU_TEMP ]]; then GPU_STATE=active; else GPU_STATE=unreadable; fi
+    return 0
+  fi
+  [[ $GPU_MODE == auto ]] || GPU_STATE=unreadable
+}
+
+# --- Control ----------------------------------------------------------------------------
+
+curve_percent() { # OUTVAR TEMP POINTS
+  local -n __fand_pct=$1
+  local temp=$2 pts pt t p prev_t="" prev_p=""
+  read -ra pts <<<"$3"
+  for pt in "${pts[@]}"; do
+    t=$((10#${pt%%:*})) p=$((10#${pt##*:}))
+    if ((temp <= t)); then
+      if [[ -z $prev_t ]]; then
+        __fand_pct=$p
+      else
+        __fand_pct=$((prev_p + (temp - prev_t) * (p - prev_p) / (t - prev_t)))
+      fi
+      return 0
+    fi
+    prev_t=$t prev_p=$p
+  done
+  __fand_pct=100 # hotter than the last point: as fast as max_percent allows
+}
+
+warn_once() { # KEY MESSAGE
+  [[ -n ${WARNED[$1]+set} ]] && return 0
+  WARNED[$1]=1
+  log "WARNING: $2"
+}
+
+clear_warning() { # KEY MESSAGE
+  [[ -n ${WARNED[$1]+set} ]] || return 0
+  unset "WARNED[$1]"
+  log "$2"
+}
+
+set_duty() { # CHANNEL PERCENT
+  local ch=$1 pct=$2 raw
+  if is_protected "$ch"; then
+    log "REFUSED: channel $ch is protected" # unreachable after setup; kept as a guard
+    return 1
+  fi
+  ((pct > CH_MAX[$ch])) && pct=${CH_MAX[$ch]}
+  ((pct < 0)) && pct=0
+  raw=$(((pct * 255 + 50) / 100))
+  if ((DRY_RUN)); then
+    [[ ${LAST_RAW[$ch]:-} == "$raw" ]] || log "dry-run: pwm$ch <- $raw (${pct}%) ${CH_LABEL[$ch]}"
+  elif ! printf '%s\n' "$raw" 2>/dev/null >"$HW/pwm$ch"; then
+    warn_once "write-$ch" "writing $HW/pwm$ch failed"
+  fi
+  LAST_RAW[$ch]=$raw
+}
+
+FIRST=1
+tick() {
+  local ch target failed c need_gpu=0
+  read_cpu_temp
+  for ch in "${CHANNELS[@]}"; do
+    [[ -n ${CH_GPU[$ch]} ]] && need_gpu=1
+  done
+  ((need_gpu)) && read_gpu_temp
+
+  for ch in "${CHANNELS[@]}"; do
+    target=${CH_MIN[$ch]} failed=0
+    if [[ -n ${CH_CPU[$ch]} ]]; then
+      if [[ -n $CPU_TEMP ]]; then
+        curve_percent c "$CPU_TEMP" "${CH_CPU[$ch]}"
+        ((c > target)) && target=$c
+      else
+        failed=1
+      fi
+    fi
+    if [[ -n ${CH_GPU[$ch]} ]]; then
+      case $GPU_STATE in
+        active)
+          curve_percent c "$GPU_TEMP" "${CH_GPU[$ch]}"
+          ((c > target)) && target=$c
+          ;;
+        asleep) ;;
+        *) failed=1 ;;
+      esac
+    fi
+
+    if ((failed)); then
+      warn_once "sensor-$ch" "channel $ch: a configured temperature is unreadable; holding failsafe_percent (${CH_FAILSAFE[$ch]}%)"
+      CURRENT[$ch]=${CH_FAILSAFE[$ch]}
+    else
+      clear_warning "sensor-$ch" "channel $ch: temperatures are readable again"
+      # Rise immediately; ease down so the fans do not hunt.
+      if ((FIRST || target >= CURRENT[$ch])); then
+        CURRENT[$ch]=$target
+      else
+        CURRENT[$ch]=$((CURRENT[$ch] - FALLOFF))
+        ((CURRENT[$ch] < target)) && CURRENT[$ch]=$target
+      fi
+    fi
+    ((CURRENT[$ch] > CH_MAX[$ch])) && CURRENT[$ch]=${CH_MAX[$ch]}
+    set_duty "$ch" "${CURRENT[$ch]}"
+  done
+  FIRST=0
+}
+
+take_over() { # CHANNEL
+  local ch=$1 enable=$HW/pwm${1}_enable record=$RUN_DIR/pwm$1.original current
+  [[ -e $enable ]] || die "channel $ch: $enable does not exist, so manual control is not possible"
+  read_into current "$enable" || die "channel $ch: cannot read $enable"
+
+  if ((DRY_RUN)); then
+    ORIGINAL[$ch]=$current RESTORABLE[$ch]=untested
+    log "dry-run: would take over pwm$ch (${CH_LABEL[$ch]}), currently mode $current"
+    return 0
+  fi
+
+  if [[ -r $record ]]; then
+    # Taken over earlier this boot and the daemon restarted: the channel is
+    # already manual, so this record is the only place its original mode survives.
+    read -r "ORIGINAL[$ch]" "RESTORABLE[$ch]" <"$record"
+  else
+    ORIGINAL[$ch]=$current
+    if [[ $current == 1 ]]; then
+      RESTORABLE[$ch]=manual # already manual: no automatic mode to hand back
+    elif printf '%s\n' "$current" 2>/dev/null >"$enable"; then
+      # Writing the current mode back changes nothing, but proves the driver
+      # accepts that mode, so it can be restored on exit.
+      RESTORABLE[$ch]=yes
+    else
+      RESTORABLE[$ch]=no
+    fi
+    { mkdir -p "$RUN_DIR" && printf '%s %s\n' "${ORIGINAL[$ch]}" "${RESTORABLE[$ch]}" >"$record"; } 2>/dev/null ||
+      log "WARNING: cannot record the original mode of pwm$ch in $RUN_DIR"
+  fi
+
+  if [[ ${RESTORABLE[$ch]} == no && $ALLOW_IRREVERSIBLE != yes ]]; then
+    die "channel $ch: the driver rejects restoring mode ${ORIGINAL[$ch]}, so this channel could not be handed back to the hardware until reboot. If you accept that, set allow_irreversible = yes; on exit it will then hold failsafe_percent."
+  fi
+
+  printf '1\n' 2>/dev/null >"$enable" || die "channel $ch: cannot switch $enable to manual mode"
+  log "controlling pwm$ch (${CH_LABEL[$ch]}), was mode ${ORIGINAL[$ch]}, restorable: ${RESTORABLE[$ch]}"
+}
+
+# On any exit: hand each channel back to the hardware if possible, otherwise pin
+# its fail-safe speed, which the chip holds with no daemon running.
+release() {
+  local ch raw
+  for ch in "${TAKEN[@]}"; do
+    if ((DRY_RUN)); then
+      log "dry-run: would release pwm$ch"
+      continue
+    fi
+    if [[ ${RESTORABLE[$ch]} == yes ]] && printf '%s\n' "${ORIGINAL[$ch]}" 2>/dev/null >"$HW/pwm${ch}_enable"; then
+      log "exit: pwm$ch handed back to mode ${ORIGINAL[$ch]}"
+      continue
+    fi
+    raw=$(((CH_FAILSAFE[$ch] * 255 + 50) / 100))
+    if printf '1\n' 2>/dev/null >"$HW/pwm${ch}_enable" && printf '%s\n' "$raw" 2>/dev/null >"$HW/pwm$ch"; then
+      log "exit: pwm$ch pinned at ${CH_FAILSAFE[$ch]}%"
+    else
+      log "exit: WARNING could not put pwm$ch in a safe state"
+    fi
+  done
+}
+
+# --- Main ------------------------------------------------------------------------------
+
+setup
+
+if [[ $MODE == check ]]; then
+  need_gpu=0
+  read_cpu_temp
+  for ch in "${CHANNELS[@]}"; do
+    [[ -n ${CH_GPU[$ch]} ]] && need_gpu=1
+  done
+  ((need_gpu)) && read_gpu_temp
+  log "chip $CHIP at $HW"
+  ((${#PROTECT[@]})) && log "protected channels: ${PROTECT[*]}"
+  for ch in "${CHANNELS[@]}"; do
+    read_into mode "$HW/pwm${ch}_enable" || mode="?"
+    log "pwm$ch (${CH_LABEL[$ch]}): ${CH_MIN[$ch]}-${CH_MAX[$ch]}%, failsafe ${CH_FAILSAFE[$ch]}%, mode now $mode"
+    [[ -z ${CH_CPU[$ch]} || -n $CPU_TEMP ]] || die "channel $ch has cpu_curve but no CPU temperature is readable"
+    if [[ -n ${CH_GPU[$ch]} ]]; then
+      case $GPU_STATE in
+        active) ;;
+        asleep) log "note: the GPU is asleep, so gpu_curve is ignored until it wakes" ;;
+        *) die "channel $ch has gpu_curve but no GPU temperature is readable (gpu = $GPU_MODE)" ;;
+      esac
+    fi
+  done
+  log "CPU ${CPU_TEMP:-?}°C$( ((need_gpu)) && printf ', GPU %s°C (%s)' "${GPU_TEMP:-?}" "$GPU_STATE")"
+  log "config OK"
+  exit 0
+fi
+
+if ((!DRY_RUN && EUID != 0)) && [[ ${SYSMON_FAND_ALLOW_NONROOT:-} != 1 ]]; then
+  die "must run as root (try --dry-run to watch without writing anything)"
+fi
+
+RUNNING=1
+trap 'RUNNING=0' INT TERM
+trap release EXIT
+
+for ch in "${CHANNELS[@]}"; do
+  take_over "$ch"
+  TAKEN+=("$ch")
+  CURRENT[$ch]=${CH_FAILSAFE[$ch]}
+done
+
+while ((RUNNING)); do
+  tick
+  ((ONCE)) && break
+  sleep "$INTERVAL" &
+  wait $! 2>/dev/null
+done
+exit 0

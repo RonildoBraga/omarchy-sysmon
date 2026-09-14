@@ -1,0 +1,7 @@
+#!/bin/sh
+# Fake nvidia-smi. Records each call when SYSMON_TEST_MARK is set.
+[ -n "${SYSMON_TEST_MARK:-}" ] && echo called >>"$SYSMON_TEST_MARK"
+case "$*" in
+  *name,*) echo "NVIDIA Test GPU, 45, 12, 1024, 12282, 30.50" ;;
+  *) echo "45" ;;
+esac

@@ -1,0 +1,38 @@
+# sysmon-fand configuration.
+#
+# install.sh copies this to /etc/sysmon-fand/fand.conf. Everything below is
+# commented out, and the daemon refuses to start until you fill it in for YOUR
+# hardware. Run `sysmon-fand-detect` and read fan-control/README.md first.
+#
+# Format: one `key = value` per line. Anything after # is a comment.
+
+# hwmon name of the chip that owns the fan headers (sysmon-fand-detect lists them).
+# chip = nct6798
+
+# Seconds between adjustments.
+# interval = 3
+
+# Where GPU temperature comes from: auto, nvidia, amd or none.
+# gpu = auto
+
+# Channels that must NEVER be written, comma-separated. Put pumps here, and
+# anything else that must always run at the speed the firmware gives it.
+# protect =
+
+# Largest drop in speed per interval, in percent. Rising is always immediate.
+# falloff_percent = 2
+
+# Some drivers refuse to switch a channel back to automatic mode once it has
+# been taken over. The daemon checks this first and refuses to start unless you
+# set yes. With yes, stopping the daemon holds failsafe_percent until reboot.
+# allow_irreversible = no
+
+# One block per PWM channel to control. N is the pwmN number, which is not
+# necessarily the same as the fanN it drives.
+#
+# channel.N.label            = Case fans
+# channel.N.min_percent      = 20
+# channel.N.max_percent      = 100
+# channel.N.failsafe_percent = 100                       # on exit and when a sensor fails
+# channel.N.cpu_curve        = 50:20 65:40 75:70 85:100  # tempC:percent pairs
+# channel.N.gpu_curve        = 55:20 70:50 80:100

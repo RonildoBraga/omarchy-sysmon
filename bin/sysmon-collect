@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# sysmon-collect: read CPU, GPU, memory and fan sensors, print one JSON object.
+#
+# Usage: sysmon-collect [--gpu auto|nvidia|amd|none]
+#
+# Read-only, and all hardware is detected at runtime: nothing in this file is
+# specific to one machine. These overrides let the test suite point it at fake
+# sysfs and procfs trees:
+#
+#   SYSMON_SYSFS       sysfs root              (default /sys)
+#   SYSMON_PROC        procfs root             (default /proc)
+#   SYSMON_NVIDIA_SMI  nvidia-smi executable   (default nvidia-smi)
+#   SYSMON_STATE       previous CPU sample     (default $XDG_RUNTIME_DIR/sysmon-collect.state)
+#   SYSMON_FAN_UNIT    fan control service     (default sysmon-fand.service)
+
+set -uo pipefail
+
+SYS=${SYSMON_SYSFS:-/sys}
+PROC=${SYSMON_PROC:-/proc}
+NVIDIA_SMI=${SYSMON_NVIDIA_SMI:-nvidia-smi}
+STATE=${SYSMON_STATE:-${XDG_RUNTIME_DIR:-/tmp}/sysmon-collect.state}
+FAN_UNIT=${SYSMON_FAN_UNIT:-sysmon-fand.service}
+
+die() { printf 'sysmon-collect: %s\n' "$*" >&2; exit 2; }
+
+gpu_mode=auto
+while (($#)); do
+  case $1 in
+    --gpu) (($# >= 2)) || die "--gpu needs a value"; gpu_mode=$2; shift 2 ;;
+    -h | --help) sed -n '4p' "$0" | sed 's/^# //'; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+[[ $gpu_mode =~ ^(auto|nvidia|amd|none)$ ]] || die "--gpu must be auto, nvidia, amd or none"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+
+# Read the first line of file $2 into the variable named $1, without a subshell.
+read_into() {
+  local -n __sysmon_dest=$1
+  __sysmon_dest=""
+  [[ -r $2 ]] || return 1
+  { IFS= read -r __sysmon_dest || [[ -n $__sysmon_dest ]]; } 2>/dev/null <"$2"
+}
+
+# --- CPU usage: delta against the previous sample --------------------------------
+
+cpu_sample() {
+  local _cpu user nice system idle iowait irq softirq steal _rest
+  read -r _cpu user nice system idle iowait irq softirq steal _rest <"$PROC/stat"
+  busy=$((user + nice + system + ${irq:-0} + ${softirq:-0} + ${steal:-0}))
+  total=$((busy + idle + ${iowait:-0}))
+}
+
+cpu_sample
+prev_busy="" prev_total=""
+[[ -r $STATE ]] && read -r prev_busy prev_total <"$STATE"
+if ! [[ $prev_busy =~ ^[0-9]+$ && $prev_total =~ ^[0-9]+$ ]] || ((total <= prev_total)); then
+  # No usable previous sample (first run, or counters reset by a reboot): take a
+  # short second sample so the first reading is not a meaningless 0%.
+  prev_busy=$busy prev_total=$total
+  sleep 0.25
+  cpu_sample
+fi
+cpu_pct=0
+if ((total > prev_total && busy >= prev_busy)); then
+  cpu_pct=$((((busy - prev_busy) * 100 + (total - prev_total) / 2) / (total - prev_total)))
+fi
+((cpu_pct > 100)) && cpu_pct=100
+printf '%s %s\n' "$busy" "$total" 2>/dev/null >"$STATE" || true
+
+# --- Memory and load ------------------------------------------------------------------
+
+mem_total=0 mem_avail=0 swap_total=0 swap_free=0
+while read -r key value _; do
+  case $key in
+    MemTotal:) mem_total=$value ;;
+    MemAvailable:) mem_avail=$value ;;
+    SwapTotal:) swap_total=$value ;;
+    SwapFree:) swap_free=$value ;;
+  esac
+done <"$PROC/meminfo"
+read -r load1 load5 load15 _ <"$PROC/loadavg"
+
+# --- hwmon helpers ----------------------------------------------------------------------
+
+hw_dirs=() hw_names=()
+for d in "$SYS"/class/hwmon/hwmon*; do
+  read_into n "$d/name" || continue
+  hw_dirs+=("$d") hw_names+=("$n")
+done
+
+hwmon_by_name() { # OUTVAR NAME
+  local -n __sysmon_hw=$1
+  local i
+  for i in "${!hw_names[@]}"; do
+    if [[ ${hw_names[i]} == "$2" ]]; then
+      __sysmon_hw=${hw_dirs[i]}
+      return 0
+    fi
+  done
+  return 1
+}
+
+temp_by_label() { # OUTVAR DIR LABEL...  (first label found wins)
+  local -n __sysmon_temp=$1
+  local dir=$2 want f label raw
+  shift 2
+  __sysmon_temp=""
+  for want in "$@"; do
+    for f in "$dir"/temp*_label; do
+      read_into label "$f" || continue
+      [[ $label == "$want" ]] || continue
+      read_into raw "${f%_label}_input" && [[ $raw =~ ^-?[0-9]+$ ]] || continue
+      __sysmon_temp=$((raw / 1000))
+      return 0
+    done
+  done
+  return 1
+}
+
+# --- CPU temperature --------------------------------------------------------------------
+
+cpu_temp=""
+for chip in coretemp k10temp zenpower cpu_thermal; do
+  hwmon_by_name hw "$chip" || continue
+  case $chip in
+    coretemp) temp_by_label cpu_temp "$hw" "Package id 0" ;;
+    k10temp | zenpower) temp_by_label cpu_temp "$hw" Tdie Tctl ;;
+    cpu_thermal) read_into raw "$hw/temp1_input" && [[ $raw =~ ^-?[0-9]+$ ]] && cpu_temp=$((raw / 1000)) ;;
+  esac
+  [[ -n $cpu_temp ]] && break
+done
+
+# --- GPU --------------------------------------------------------------------------------
+
+gpu_source="" gpu_state="" gpu_name="" gpu_pct="" gpu_temp="" vram_used="" vram_total="" gpu_watts=""
+
+# True when every NVIDIA display device is runtime-suspended. nvidia-smi would
+# wake it, and on a laptop that keeps the discrete GPU from ever sleeping.
+nvidia_asleep() {
+  local dev vendor class status found=0
+  for dev in "$SYS"/bus/pci/devices/*; do
+    read_into vendor "$dev/vendor" && read_into class "$dev/class" || continue
+    [[ $vendor == 0x10de && $class == 0x03* ]] || continue
+    found=1
+    read_into status "$dev/power/runtime_status" || status=active
+    [[ $status == suspended ]] || return 1
+  done
+  ((found))
+}
+
+read_nvidia() {
+  local out line name temp util used total watts
+  command -v "$NVIDIA_SMI" >/dev/null 2>&1 || return 1
+  if nvidia_asleep; then
+    gpu_source=nvidia gpu_state=suspended
+    return 0
+  fi
+  out=$("$NVIDIA_SMI" --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
+    --format=csv,noheader,nounits 2>/dev/null) || return 1
+  line=${out%%$'\n'*}
+  [[ -n $line ]] || return 1
+  IFS=, read -r name temp util used total watts <<<"$line"
+  name=${name#"${name%%[![:space:]]*}"} name=${name%"${name##*[![:space:]]}"}
+  gpu_source=nvidia gpu_state=active gpu_name=${name#NVIDIA }
+  gpu_temp=${temp//[^0-9]/} gpu_pct=${util//[^0-9]/}
+  vram_used=${used//[^0-9]/} vram_total=${total//[^0-9]/}
+  watts=${watts//[^0-9.]/}
+  [[ $watts =~ ^[0-9]+(\.[0-9]+)?$ ]] && gpu_watts=$watts
+  return 0
+}
+
+read_amd() {
+  local hw raw p
+  hwmon_by_name hw amdgpu || return 1
+  gpu_source=amd gpu_state=active gpu_name="AMD GPU"
+  temp_by_label gpu_temp "$hw" edge ||
+    { read_into raw "$hw/temp1_input" && [[ $raw =~ ^-?[0-9]+$ ]] && gpu_temp=$((raw / 1000)); }
+  read_into raw "$hw/device/gpu_busy_percent" && [[ $raw =~ ^[0-9]+$ ]] && gpu_pct=$raw
+  read_into raw "$hw/device/mem_info_vram_used" && [[ $raw =~ ^[0-9]+$ ]] && vram_used=$((raw / 1048576))
+  read_into raw "$hw/device/mem_info_vram_total" && [[ $raw =~ ^[0-9]+$ ]] && vram_total=$((raw / 1048576))
+  for p in power1_average power1_input; do
+    if read_into raw "$hw/$p" && [[ $raw =~ ^[0-9]+$ ]]; then
+      gpu_watts=$((raw / 1000000))
+      break
+    fi
+  done
+  return 0
+}
+
+case $gpu_mode in
+  auto) read_nvidia || read_amd ;;
+  nvidia) read_nvidia ;;
+  amd) read_amd ;;
+esac
+
+# --- Fans and PWM channels (read-only) ------------------------------------------------------
+
+fan_rows="" pwm_rows=""
+for i in "${!hw_dirs[@]}"; do
+  d=${hw_dirs[i]} chip=${hw_names[i]}
+  for f in "$d"/fan[0-9]*_input; do
+    [[ $f =~ /fan([0-9]+)_input$ ]] || continue
+    idx=${BASH_REMATCH[1]}
+    read_into rpm "$f" && [[ $rpm =~ ^[0-9]+$ ]] || continue
+    read_into label "$d/fan${idx}_label" || label=""
+    label=${label//[$'\t\n']/ }
+    fan_rows+="$chip"$'\t'"$idx"$'\t'"$rpm"$'\t'"$label"$'\n'
+  done
+  for f in "$d"/pwm[0-9]*; do
+    [[ $f =~ /pwm([0-9]+)$ ]] || continue
+    idx=${BASH_REMATCH[1]}
+    read_into raw "$f" && [[ $raw =~ ^[0-9]+$ ]] || continue
+    read_into mode "${f}_enable" || mode=""
+    pwm_rows+="$chip"$'\t'"$idx"$'\t'"$(((raw * 100 + 127) / 255))"$'\t'"$mode"$'\n'
+  done
+done
+
+fan_control=absent
+if command -v systemctl >/dev/null 2>&1 &&
+  [[ $(systemctl show --property=LoadState --value "$FAN_UNIT" 2>/dev/null) == loaded ]]; then
+  if systemctl is-active --quiet "$FAN_UNIT"; then fan_control=active; else fan_control=inactive; fi
+fi
+
+# --- Output ------------------------------------------------------------------------------------
+
+jq -cn \
+  --argjson cpu_pct "$cpu_pct" --arg cpu_temp "$cpu_temp" \
+  --arg load1 "$load1" --arg load5 "$load5" --arg load15 "$load15" \
+  --argjson mem_total "${mem_total:-0}" --argjson mem_avail "${mem_avail:-0}" \
+  --argjson swap_total "${swap_total:-0}" --argjson swap_free "${swap_free:-0}" \
+  --arg gpu_source "$gpu_source" --arg gpu_state "$gpu_state" --arg gpu_name "$gpu_name" \
+  --arg gpu_pct "$gpu_pct" --arg gpu_temp "$gpu_temp" \
+  --arg vram_used "$vram_used" --arg vram_total "$vram_total" --arg gpu_watts "$gpu_watts" \
+  --arg fans "$fan_rows" --arg pwm "$pwm_rows" --arg fan_control "$fan_control" '
+  def num: if . == "" then null else tonumber end;
+  def gib: . / 1048576 * 10 | round / 10;
+  def share($part; $whole): if $whole > 0 then ($part * 100 / $whole | round) else 0 end;
+  def rows: split("\n") | map(select(length > 0) | split("\t"));
+  {
+    cpu: { pct: $cpu_pct, temp: ($cpu_temp | num), load: ([$load1, $load5, $load15] | map(tonumber)) },
+    gpu: (if $gpu_source == "" then null else {
+      source: $gpu_source,
+      state: $gpu_state,
+      name: (if $gpu_name == "" then null else $gpu_name end),
+      pct: ($gpu_pct | num),
+      temp: ($gpu_temp | num),
+      vramUsedMiB: ($vram_used | num),
+      vramTotalMiB: ($vram_total | num),
+      watts: ($gpu_watts | num)
+    } end),
+    mem: (($mem_total - $mem_avail) as $used
+      | { pct: share($used; $mem_total), usedGiB: ($used | gib), totalGiB: ($mem_total | gib) }),
+    swap: (($swap_total - $swap_free) as $used
+      | { pct: share($used; $swap_total), usedGiB: ($used | gib), totalGiB: ($swap_total | gib) }),
+    fans: ($fans | rows | map({
+      chip: .[0], index: (.[1] | tonumber), rpm: (.[2] | tonumber),
+      label: (if (.[3] // "") == "" then null else .[3] end)
+    })),
+    pwm: ($pwm | rows | map({
+      chip: .[0], index: (.[1] | tonumber), duty: (.[2] | tonumber), mode: ((.[3] // "") | num)
+    })),
+    fanControl: $fan_control
+  }'

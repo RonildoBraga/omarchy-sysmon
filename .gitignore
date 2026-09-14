@@ -1,0 +1,10 @@
+# Editor and backup files
+*~
+*.swp
+*.bak
+*.bak.*
+
+# Personal configuration never belongs in this repository. Plugin settings live
+# in your own ~/.config/omarchy/shell.json, and fan control settings in
+# /etc/sysmon-fand/fand.conf.
+fand.conf
